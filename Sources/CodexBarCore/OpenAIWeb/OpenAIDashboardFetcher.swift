@@ -27,6 +27,13 @@ public struct OpenAIDashboardFetcher {
 
     public init() {}
 
+    #if DEBUG
+    var preflightForTesting: ((WKWebsiteDataStore, Date) async throws
+        -> (apiData: DashboardAPIData?, verifiedSignedInEmail: String?))?
+    var webViewCacheForTesting: OpenAIDashboardWebViewCache?
+    var debugArtifactWriterForTesting: ((String, String?) -> Void)?
+    #endif
+
     public nonisolated static func offscreenHostWindowFrame(for visibleFrame: CGRect) -> CGRect {
         let width: CGFloat = min(1200, visibleFrame.width)
         let height: CGFloat = min(1600, visibleFrame.height)
@@ -252,7 +259,7 @@ public struct OpenAIDashboardFetcher {
         let deadline = Self.deadline(startingAt: startedAt, timeout: timeout)
         let logLine: (String) -> Void = { logger?($0) }
         logLine("dashboard phase=api_preflight")
-        let preflight = try await Self.fetchDashboardAPIPreflight(
+        let preflight = try await self.dashboardAPIPreflight(
             websiteDataStore: websiteDataStore,
             deadline: deadline,
             logger: logLine)
@@ -276,29 +283,39 @@ public struct OpenAIDashboardFetcher {
             throw FetchError.noDashboardData(body: "OpenAI dashboard APIs unavailable and page scrape disabled.")
         }
 
-        let remainingTimeout = try Self.requiredRemainingTimeout(until: deadline)
-        logLine("dashboard phase=webview_acquire")
-        let lease = try await self.makeWebView(
-            websiteDataStore: websiteDataStore,
-            logger: logger,
-            timeout: remainingTimeout,
-            allowNavigationTimeoutRetry: allowNavigationTimeoutRetry)
-        defer {
-            lease.setPreserveLoadedPageOnRelease(false)
-            lease.release()
-            logLine("dashboard phase=webview_released elapsed=\(Self.phaseElapsed(since: startedAt))")
+        do {
+            let remainingTimeout = try Self.requiredRemainingTimeout(until: deadline)
+            logLine("dashboard phase=webview_acquire")
+            let lease = try await self.makeWebView(
+                websiteDataStore: websiteDataStore,
+                logger: logger,
+                timeout: remainingTimeout,
+                allowNavigationTimeoutRetry: allowNavigationTimeoutRetry)
+            defer {
+                lease.setPreserveLoadedPageOnRelease(false)
+                lease.release()
+                logLine("dashboard phase=webview_released elapsed=\(Self.phaseElapsed(since: startedAt))")
+            }
+            logLine("dashboard phase=hydrate elapsed=\(Self.phaseElapsed(since: startedAt))")
+            return try await self.collectPageSnapshot(.init(
+                webView: lease.webView,
+                apiData: apiData,
+                verifiedSignedInEmail: verifiedSignedInEmail,
+                subscriptionResult: .unavailable,
+                previousSnapshot: previousSnapshot,
+                deadline: deadline,
+                startedAt: startedAt,
+                debugDumpHTML: debugDumpHTML,
+                log: lease.log))
+        } catch let error as URLError where error.code == .timedOut {
+            try Task.checkCancellation()
+            guard let apiData, apiData.hasUsageData, let verifiedSignedInEmail else { throw error }
+            logLine("dashboard page deadline reached; returning verified API snapshot")
+            return Self.snapshotByMergingAPI(
+                apiData: apiData,
+                verifiedEmail: verifiedSignedInEmail,
+                previous: previousSnapshot)
         }
-        logLine("dashboard phase=hydrate elapsed=\(Self.phaseElapsed(since: startedAt))")
-        return try await self.collectPageSnapshot(.init(
-            webView: lease.webView,
-            apiData: apiData,
-            verifiedSignedInEmail: verifiedSignedInEmail,
-            subscriptionResult: .unavailable,
-            previousSnapshot: previousSnapshot,
-            deadline: deadline,
-            startedAt: startedAt,
-            debugDumpHTML: debugDumpHTML,
-            log: lease.log))
     }
 
     /// Fetches optional subscription metadata independently of the dashboard result.
@@ -584,7 +601,13 @@ public struct OpenAIDashboardFetcher {
         allowNavigationTimeoutRetry: Bool = true,
         preserveLoadedPageOnRelease: Bool = false) async throws -> OpenAIDashboardWebViewLease
     {
-        try await OpenAIDashboardWebViewCache.shared.acquire(
+        let cache: OpenAIDashboardWebViewCache
+        #if DEBUG
+        cache = self.webViewCacheForTesting ?? .shared
+        #else
+        cache = .shared
+        #endif
+        return try await cache.acquire(
             websiteDataStore: websiteDataStore,
             usageURL: self.usageURL,
             logger: logger,
@@ -644,6 +667,21 @@ public struct OpenAIDashboardFetcher {
             creditsAvailable: response.credits.map { $0.hasCredits && !$0.unlimited },
             codexCreditLimit: response.resolvedIndividualLimit?.codexCreditLimitSnapshot(updatedAt: Date()),
             accountPlan: response.planType?.rawValue)
+    }
+
+    private func dashboardAPIPreflight(
+        websiteDataStore: WKWebsiteDataStore,
+        deadline: Date,
+        logger: @escaping (String) -> Void) async throws
+        -> (apiData: DashboardAPIData?, verifiedSignedInEmail: String?)
+    {
+        #if DEBUG
+        if let preflightForTesting {
+            return try await preflightForTesting(websiteDataStore, deadline)
+        }
+        #endif
+        return try await Self.fetchDashboardAPIPreflight(
+            websiteDataStore: websiteDataStore, deadline: deadline, logger: logger)
     }
 
     private static func fetchDashboardAPIPreflight(
@@ -1241,7 +1279,7 @@ extension OpenAIDashboardFetcher {
            probe.loginRequired || probe.cloudflareInterstitial,
            let html = try? await self.fetchDebugHTML(webView: webView, deadline: deadline)
         {
-            Self.writeDebugArtifacts(html: html, bodyText: nil, logger: logger)
+            self.writePageDebugArtifacts(html: html, bodyText: nil, logger: logger)
         }
         Self.logBlockingStateIfNeeded(probe, logger: logger)
         try Self.throwIfBlockingReadinessState(probe)

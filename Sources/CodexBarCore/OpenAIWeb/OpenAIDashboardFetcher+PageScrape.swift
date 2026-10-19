@@ -32,30 +32,14 @@ extension OpenAIDashboardFetcher {
     }
 
     func collectPageSnapshot(_ context: PageScrapeContext) async throws -> OpenAIDashboardSnapshot {
-        do {
-            return try await self.collectPageSnapshotBeforeDeadline(context)
-        } catch let error as URLError where error.code == .timedOut {
-            try Task.checkCancellation()
-            // A stalled optional page must not discard an already verified API result.
-            guard let apiData = context.apiData, apiData.hasUsageData,
-                  let verifiedSignedInEmail = context.verifiedSignedInEmail
-            else { throw error }
-            context.log("dashboard JavaScript deadline reached; returning verified API snapshot")
-            return Self.snapshotByMergingAPI(
-                apiData: apiData,
-                verifiedEmail: verifiedSignedInEmail,
-                subscriptionResult: context.subscriptionResult,
-                previous: context.previousSnapshot)
-        }
-    }
-
-    private func collectPageSnapshotBeforeDeadline(
-        _ context: PageScrapeContext) async throws -> OpenAIDashboardSnapshot
-    {
         let webView = context.webView
         let apiData = context.apiData
         let verifiedSignedInEmail = context.verifiedSignedInEmail
-        let deadline = context.deadline
+        // Reserve diagnostic time inside the original budget, rather than attempting
+        // JavaScript only after that budget has already expired.
+        let remaining = max(0, context.deadline.timeIntervalSinceNow)
+        let diagnosticReserve = context.debugDumpHTML ? min(1, remaining * 0.2) : 0
+        let deadline = context.deadline.addingTimeInterval(-diagnosticReserve)
         let log = context.log
         var lastBody: String?
         var lastHref: String?
@@ -84,7 +68,7 @@ extension OpenAIDashboardFetcher {
             }
 
             if probe.workspacePicker {
-                try await Self.sleepForDashboardPoll(.milliseconds(500))
+                try await Self.sleepForPagePoll(until: deadline, duration: .milliseconds(500))
                 continue
             }
 
@@ -102,7 +86,7 @@ extension OpenAIDashboardFetcher {
                 cloudflareInterstitial: probe.cloudflareInterstitial)
             {
                 _ = webView.load(Self.usageURLRequest(url: self.usageURL))
-                try await Self.sleepForDashboardPoll(.milliseconds(500))
+                try await Self.sleepForPagePoll(until: deadline, duration: .milliseconds(500))
                 continue
             }
 
@@ -124,7 +108,7 @@ extension OpenAIDashboardFetcher {
                         "rows=\(probe.rowCount)")
                 if probe.didScrollToCredits {
                     log("scrollIntoView(Credits usage history) requested; waiting…")
-                    try await Self.sleepForDashboardPoll(.milliseconds(600))
+                    try await Self.sleepForPagePoll(until: deadline, duration: .milliseconds(600))
                     continue
                 }
                 if Self.shouldWaitForCreditsHistory(
@@ -132,7 +116,7 @@ extension OpenAIDashboardFetcher {
                     anyDashboardSignalAt: anyDashboardSignalAt,
                     creditsHeaderVisibleAt: creditsHeaderVisibleAt)
                 {
-                    try await Self.sleepForDashboardPoll(.milliseconds(400))
+                    try await Self.sleepForPagePoll(until: deadline, duration: .milliseconds(400))
                     continue
                 }
             }
@@ -140,13 +124,13 @@ extension OpenAIDashboardFetcher {
             if probe.hasCodeReviewSignal, !probe.usageBreakdownReady {
                 let elapsed = Date().timeIntervalSince(codeReviewFirstSeenAt ?? Date())
                 if elapsed < 6 {
-                    try await Self.sleepForDashboardPoll(.milliseconds(400))
+                    try await Self.sleepForPagePoll(until: deadline, duration: .milliseconds(400))
                     continue
                 }
             }
 
             if !probe.hasDashboardSignal, !apiHasReturnableData {
-                try await Self.sleepForDashboardPoll(.milliseconds(500))
+                try await Self.sleepForPagePoll(until: deadline, duration: .milliseconds(500))
                 continue
             }
 
@@ -157,7 +141,7 @@ extension OpenAIDashboardFetcher {
                 verifiedSignedInEmail: verifiedSignedInEmail,
                 pageSignedInEmail: scrape.signedInEmail)
             {
-                try await Self.sleepForDashboardPoll(.milliseconds(400))
+                try await Self.sleepForPagePoll(until: deadline, duration: .milliseconds(400))
                 continue
             }
             if let snapshot = try Self.snapshotForUnpairedPage(
@@ -183,7 +167,7 @@ extension OpenAIDashboardFetcher {
                 lastError: &lastUsageBreakdownError,
                 logger: log)
             {
-                try await Self.sleepForDashboardPoll(.milliseconds(400))
+                try await Self.sleepForPagePoll(until: deadline, duration: .milliseconds(400))
                 continue
             }
 
@@ -195,7 +179,7 @@ extension OpenAIDashboardFetcher {
                    anyDashboardSignalAt: anyDashboardSignalAt,
                    creditsHeaderVisibleAt: creditsHeaderVisibleAt)
             {
-                try await Self.sleepForDashboardPoll(.milliseconds(400))
+                try await Self.sleepForPagePoll(until: deadline, duration: .milliseconds(400))
                 continue
             }
 
@@ -212,10 +196,26 @@ extension OpenAIDashboardFetcher {
                     previousSnapshot: context.previousSnapshot)
             }
 
-            try await Self.sleepForDashboardPoll(.milliseconds(500))
+            try await Self.sleepForPagePoll(until: deadline, duration: .milliseconds(500))
         }
 
         return try await self.finishPageSnapshot(context, lastBody: lastBody, lastError: lastUsageBreakdownError)
+    }
+
+    private static func sleepForPagePoll(until deadline: Date, duration: Duration) async throws {
+        try Task.checkCancellation()
+        let remaining = max(0, deadline.timeIntervalSinceNow)
+        try await Self.sleepForDashboardPoll(min(duration, .seconds(remaining)))
+    }
+
+    func writePageDebugArtifacts(html: String, bodyText: String?, logger: (String) -> Void) {
+        #if DEBUG
+        if let debugArtifactWriterForTesting {
+            debugArtifactWriterForTesting(html, bodyText)
+            return
+        }
+        #endif
+        Self.writeDebugArtifacts(html: html, bodyText: bodyText, logger: logger)
     }
 
     private func finishPageSnapshot(
@@ -238,8 +238,9 @@ extension OpenAIDashboardFetcher {
             webView: webView,
             deadline: context.deadline)
         {
-            Self.writeDebugArtifacts(html: html, bodyText: lastBody, logger: log)
+            self.writePageDebugArtifacts(html: html, bodyText: lastBody, logger: log)
         }
+        try Task.checkCancellation()
         throw FetchError.noDashboardData(body: lastError ?? lastBody ?? "")
     }
 
