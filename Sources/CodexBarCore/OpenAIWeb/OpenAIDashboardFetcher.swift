@@ -356,7 +356,7 @@ public struct OpenAIDashboardFetcher {
 
         while Date() < deadline {
             try Task.checkCancellation()
-            let probe = try await self.probeReadiness(webView: webView)
+            let probe = try await self.probeReadiness(webView: webView, deadline: deadline)
             lastHref = probe.href ?? lastHref
             lastEmail = probe.signedInEmail ?? lastEmail
 
@@ -447,8 +447,11 @@ public struct OpenAIDashboardFetcher {
         let didScrollToCredits: Bool
     }
 
-    func probeReadiness(webView: WKWebView) async throws -> ReadinessProbe {
-        let any = try await webView.evaluateJavaScript(openAIDashboardReadinessScript)
+    func probeReadiness(webView: WKWebView, deadline: Date) async throws -> ReadinessProbe {
+        let any = try await OpenAIWebJavaScript.evaluate(
+            openAIDashboardReadinessScript,
+            in: webView,
+            deadline: deadline)
         guard let dict = any as? [String: Any] else {
             return ReadinessProbe(
                 loginRequired: true,
@@ -490,8 +493,8 @@ public struct OpenAIDashboardFetcher {
             hasDashboardSignal: (dict["hasDashboardSignal"] as? Bool) ?? false)
     }
 
-    func scrape(webView: WKWebView) async throws -> ScrapeResult {
-        let any = try await webView.evaluateJavaScript(openAIDashboardScrapeScript)
+    func scrape(webView: WKWebView, deadline: Date) async throws -> ScrapeResult {
+        let any = try await OpenAIWebJavaScript.evaluate(openAIDashboardScrapeScript, in: webView, deadline: deadline)
         guard let dict = any as? [String: Any] else {
             return ScrapeResult(
                 loginRequired: true,
@@ -567,9 +570,11 @@ public struct OpenAIDashboardFetcher {
             didScrollToCredits: (dict["didScrollToCredits"] as? Bool) ?? false)
     }
 
-    func fetchDebugHTML(webView: WKWebView) async throws -> String? {
-        try await webView.evaluateJavaScript(
-            "document.documentElement ? String(document.documentElement.outerHTML || '') : ''") as? String
+    func fetchDebugHTML(webView: WKWebView, deadline: Date) async throws -> String? {
+        try await OpenAIWebJavaScript.evaluate(
+            "document.documentElement ? String(document.documentElement.outerHTML || '') : ''",
+            in: webView,
+            deadline: deadline) as? String
     }
 
     private func makeWebView(
@@ -1229,11 +1234,12 @@ extension OpenAIDashboardFetcher {
         _ probe: ReadinessProbe,
         webView: WKWebView,
         debugDumpHTML: Bool,
+        deadline: Date,
         logger: (String) -> Void) async throws
     {
         if debugDumpHTML,
            probe.loginRequired || probe.cloudflareInterstitial,
-           let html = try? await self.fetchDebugHTML(webView: webView)
+           let html = try? await self.fetchDebugHTML(webView: webView, deadline: deadline)
         {
             Self.writeDebugArtifacts(html: html, bodyText: nil, logger: logger)
         }

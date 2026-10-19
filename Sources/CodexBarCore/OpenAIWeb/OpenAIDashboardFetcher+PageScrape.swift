@@ -32,6 +32,26 @@ extension OpenAIDashboardFetcher {
     }
 
     func collectPageSnapshot(_ context: PageScrapeContext) async throws -> OpenAIDashboardSnapshot {
+        do {
+            return try await self.collectPageSnapshotBeforeDeadline(context)
+        } catch let error as URLError where error.code == .timedOut {
+            try Task.checkCancellation()
+            // A stalled optional page must not discard an already verified API result.
+            guard let apiData = context.apiData, apiData.hasUsageData,
+                  let verifiedSignedInEmail = context.verifiedSignedInEmail
+            else { throw error }
+            context.log("dashboard JavaScript deadline reached; returning verified API snapshot")
+            return Self.snapshotByMergingAPI(
+                apiData: apiData,
+                verifiedEmail: verifiedSignedInEmail,
+                subscriptionResult: context.subscriptionResult,
+                previous: context.previousSnapshot)
+        }
+    }
+
+    private func collectPageSnapshotBeforeDeadline(
+        _ context: PageScrapeContext) async throws -> OpenAIDashboardSnapshot
+    {
         let webView = context.webView
         let apiData = context.apiData
         let verifiedSignedInEmail = context.verifiedSignedInEmail
@@ -48,7 +68,7 @@ extension OpenAIDashboardFetcher {
 
         while Date() < deadline {
             try Task.checkCancellation()
-            let probe = try await self.probeReadiness(webView: webView)
+            let probe = try await self.probeReadiness(webView: webView, deadline: deadline)
 
             if probe.href != lastHref
                 || lastFlags?.loginRequired != probe.loginRequired
@@ -72,6 +92,7 @@ extension OpenAIDashboardFetcher {
                 probe,
                 webView: webView,
                 debugDumpHTML: context.debugDumpHTML,
+                deadline: deadline,
                 logger: log)
 
             if Self.shouldReloadUsageRoute(
@@ -130,7 +151,7 @@ extension OpenAIDashboardFetcher {
             }
 
             log("dashboard phase=extract elapsed=\(Self.phaseElapsed(since: context.startedAt))")
-            let scrape = try await self.scrape(webView: webView)
+            let scrape = try await self.scrape(webView: webView, deadline: deadline)
             try Task.checkCancellation()
             if Self.shouldWaitForPageIdentity(
                 verifiedSignedInEmail: verifiedSignedInEmail,
@@ -213,7 +234,10 @@ extension OpenAIDashboardFetcher {
                 previous: context.previousSnapshot)
         }
 
-        if context.debugDumpHTML, let html = try? await self.fetchDebugHTML(webView: webView) {
+        if context.debugDumpHTML, let html = try? await self.fetchDebugHTML(
+            webView: webView,
+            deadline: context.deadline)
+        {
             Self.writeDebugArtifacts(html: html, bodyText: lastBody, logger: log)
         }
         throw FetchError.noDashboardData(body: lastError ?? lastBody ?? "")

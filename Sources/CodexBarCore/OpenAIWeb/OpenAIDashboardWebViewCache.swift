@@ -296,7 +296,7 @@ final class OpenAIDashboardWebViewCache {
     }
 
     func resetReusablePageStateForTesting(_ webView: WKWebView) async -> Bool {
-        await self.resetReusablePageState(webView)
+        await self.resetReusablePageState(webView, deadline: Date().addingTimeInterval(5))
     }
     #endif
 
@@ -548,11 +548,12 @@ final class OpenAIDashboardWebViewCache {
         }
         #endif
 
+        let preparationDeadline = Date().addingTimeInterval(timeout)
         if canReuseLoadedPage,
            let currentURL = webView.url?.absoluteString,
            OpenAIDashboardFetcher.isUsageRoute(currentURL)
         {
-            if await self.resetReusablePageState(webView) {
+            if await self.resetReusablePageState(webView, deadline: Date().addingTimeInterval(min(timeout, 5))) {
                 return
             }
 
@@ -560,6 +561,7 @@ final class OpenAIDashboardWebViewCache {
         }
 
         try Task.checkCancellation()
+        let remainingTimeout = try Self.remainingNavigationTimeout(until: preparationDeadline)
         let cancellationState = NavigationCancellationState()
         try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
@@ -569,7 +571,7 @@ final class OpenAIDashboardWebViewCache {
                 webView.navigationDelegate = delegate
                 webView.codexNavigationDelegate = delegate
                 cancellationState.install(webView: webView, delegate: delegate)
-                delegate.armTimeout(seconds: timeout)
+                delegate.armTimeout(seconds: remainingTimeout)
                 _ = webView.load(OpenAIDashboardFetcher.usageURLRequest(url: usageURL))
                 if Task.isCancelled {
                     cancellationState.cancel()
@@ -628,9 +630,12 @@ final class OpenAIDashboardWebViewCache {
         self.evictEntry(entry)
     }
 
-    private func resetReusablePageState(_ webView: WKWebView) async -> Bool {
+    private func resetReusablePageState(_ webView: WKWebView, deadline: Date) async -> Bool {
         do {
-            let any = try await webView.evaluateJavaScript(self.reusablePageResetScript)
+            let any = try await OpenAIWebJavaScript.evaluate(
+                self.reusablePageResetScript,
+                in: webView,
+                deadline: deadline)
             return (any as? Bool) ?? true
         } catch {
             return false
